@@ -86,6 +86,9 @@ describe('toAsset', () => {
       status: 'stolen',
       created_at: new Date(),
       updated_at: new Date(),
+      relist_price_cents: null,
+      first_lease_date: null,
+      first_list_price_cents: null,
     };
     expect(() => toAsset(row)).toThrow();
   });
