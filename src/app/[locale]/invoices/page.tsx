@@ -13,13 +13,19 @@ import {
   loadCo2Factors,
   loadCoefficientTable,
   loadPriceLists,
+  loadRefurbishmentCosts,
   loadResidualCurves,
   loadSecondLifeDemand,
   loadVatRates,
 } from '@/data/load';
 import { assetConditionSchema, isoDateSchema } from '@/data/schemas';
 import { calculateContractQuote } from '@/domain/contract-pricing';
-import { earlyExitForContract } from '@/domain/early-exit';
+import {
+  checkReturnInspection,
+  earlyExitForContract,
+  type ReturnInspection,
+  worseCondition,
+} from '@/domain/early-exit';
 import {
   calculateAvoidedCo2,
   calculateBuyoutSettlement,
@@ -41,10 +47,13 @@ const querySchema = z.object({
   term: z.coerce.number().int().positive(),
   down: z.coerce.number().int().min(0).default(0),
   signedOn: isoDateSchema.optional(),
-  // Early exit: the month of the term to leave in (1 = the first rent) and the condition the
-  // item is returned in. Both are only inputs to the calculation, nothing is stored.
+  // Early exit: the month of the term to leave in (1 = the first rent) and the return
+  // inspection (condition, usage reading, inspector). Only inputs to the calculation; the
+  // early-exit route stores them when a return is confirmed.
   exitMonth: z.coerce.number().int().min(1).optional(),
   condition: assetConditionSchema.optional(),
+  usage: z.coerce.number().optional(),
+  inspectedBy: z.string().trim().max(100).optional(),
 });
 
 export default async function InvoicesPage({
@@ -71,6 +80,7 @@ export default async function InvoicesPage({
     residualCurves,
     secondLifeDemand,
     co2Factors,
+    refurbishmentCosts,
   ] = await Promise.all([
     listAssets(db),
     loadPriceLists(),
@@ -79,6 +89,7 @@ export default async function InvoicesPage({
     loadResidualCurves(),
     loadSecondLifeDemand(),
     loadCo2Factors(),
+    loadRefurbishmentCosts(),
   ]);
 
   const asset = assets.find((a) => a.id === assetId);
@@ -137,13 +148,28 @@ export default async function InvoicesPage({
 
   // Early exit: leave in the chosen month (the date of that month's rent row), default month 1.
   const exitMonth = Math.min(query.data.exitMonth ?? 1, quote.termMonths);
-  const exitCondition = query.data.condition ?? 'good';
+  // The return inspection starts from the asset's record (condition and usage at the start of
+  // the lease). An impossible inspection is shown as a problem and priced at the record instead.
+  const recorded: ReturnInspection = {
+    condition: worseCondition('good', asset.condition),
+    usageValue: asset.usage.value,
+  };
+  const requested: ReturnInspection = {
+    condition: query.data.condition ?? recorded.condition,
+    usageValue: query.data.usage ?? recorded.usageValue,
+  };
+  const inspectionCheck = checkReturnInspection(
+    { condition: asset.condition, usageValue: asset.usage.value },
+    requested
+  );
+  const inspection = inspectionCheck.ok ? requested : recorded;
   const earlyExit = earlyExitForContract({
     quote,
     signedOn,
     exitMonth,
-    condition: exitCondition,
+    inspection,
     asset,
+    refurbishmentCosts,
     residualCurves,
     vatRates,
   });
@@ -270,7 +296,9 @@ export default async function InvoicesPage({
           quote={earlyExit}
           contract={{ asset: asset.id, term: quote.termMonths, down, signedOn }}
           exitMonth={exitMonth}
-          condition={exitCondition}
+          inspection={{ ...inspection, inspectedBy: query.data.inspectedBy ?? '' }}
+          inspectionProblem={inspectionCheck.ok ? undefined : inspectionCheck.problem}
+          recorded={{ condition: asset.condition, usage: asset.usage }}
           monthChoices={exitMonthChoices}
           firstListPriceCents={quote.listPriceCents}
           leaseEnded={asset.status === 'sold' || asset.status === 'returned'}

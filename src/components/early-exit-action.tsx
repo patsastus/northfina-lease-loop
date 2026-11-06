@@ -3,9 +3,11 @@
 // The button under each early-exit option. Ending a lease cannot be undone, so the first click
 // only asks for confirmation with the amount; the second sends the contract terms (never an
 // amount) to the server, which prices and records the exit. The page then reloads its data.
+// A return also sends the return inspection, and cannot be confirmed until it names who
+// inspected the item.
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
-import type { AssetCondition } from '@/data/schemas';
+import type { ReturnInspection } from '@/domain/early-exit';
 import { formatEuro } from '@/domain/money';
 import { formatIsoDate } from '@/i18n/format';
 import { getT } from '@/i18n/get-t';
@@ -16,7 +18,8 @@ export type EarlyExitActionProps = {
   choice: 'buyout' | 'return';
   contract: { asset: string; term: number; down: number; signedOn: string };
   exitMonth: number;
-  condition: AssetCondition;
+  /** The inspection shown on the page. Sent with a return; ignored for a buyout. */
+  inspection: ReturnInspection & { inspectedBy: string };
   /** Shown on the confirm button. The server recalculates it; this is for the customer only. */
   grossCents: number;
   /** The asset was already bought out or returned when the page loaded. */
@@ -37,7 +40,7 @@ export function EarlyExitAction({
   choice,
   contract,
   exitMonth,
-  condition,
+  inspection,
   grossCents,
   leaseEnded,
 }: EarlyExitActionProps) {
@@ -58,7 +61,7 @@ export function EarlyExitAction({
           downPaymentCents: contract.down,
           signedOn: contract.signedOn,
           exitMonth,
-          condition,
+          ...(choice === 'return' ? { inspection } : {}),
         }),
       });
       const json = (await response.json()) as { success?: boolean; data?: { receipt: Receipt } };
@@ -102,6 +105,14 @@ export function EarlyExitAction({
     return (
       <p className="mt-[16px] text-[0.875rem] text-[#615b57] dark:text-stone-400">
         {t('invoices.earlyExit.action.ended')}
+      </p>
+    );
+  }
+
+  if (choice === 'return' && inspection.inspectedBy.trim() === '') {
+    return (
+      <p className="mt-[16px] text-[0.875rem] text-[#615b57] dark:text-stone-400">
+        {t('invoices.earlyExit.action.needsInspection')}
       </p>
     );
   }

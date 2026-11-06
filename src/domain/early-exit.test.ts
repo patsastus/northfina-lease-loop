@@ -1,9 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { loadCoefficientTable, loadResidualCurves, loadVatRates } from '@/data/load';
+import {
+  loadCoefficientTable,
+  loadRefurbishmentCosts,
+  loadResidualCurves,
+  loadVatRates,
+} from '@/data/load';
 import type { AssetCondition } from '@/data/schemas';
 import {
   billedMonthsAsOf,
   calculateEarlyExit,
+  checkReturnInspection,
+  worseCondition,
   earlyExitForContract,
   type EarlyExitInput,
   outstandingBalanceCents,
@@ -21,6 +28,7 @@ const CARD_1 = {
   firstListPriceCents: 389_000,
   category: 'e_bike',
   usage: { unit: 'km', value: 0 },
+  usageAtStartValue: 0,
 } as const;
 
 async function cardInput(
@@ -31,6 +39,7 @@ async function cardInput(
     ...CARD_1,
     asOf,
     condition: 'good',
+    refurbishmentRules: (await loadRefurbishmentCosts()).e_bike.fixed,
     residualCurves: await loadResidualCurves(),
     vatRates: await loadVatRates(),
     ...overrides,
@@ -145,21 +154,30 @@ describe('calculateEarlyExit', () => {
     expect(quote.nominalRemainingRentsCents).toBe(29 * 10_730);
     expect(quote.balanceCents).toBe(330_666);
     // 389 000 × 80 % (age 7: 82 % at 6, 70 % at 12) × 0.85 (good) = 264 520
-    expect(quote.marketValue).toEqual({ ageMonths: 7, curvePercent: 80, valueCents: 264_520 });
+    expect(quote.marketValue).toEqual({
+      ageMonths: 7,
+      curvePercent: 80,
+      usageValue: 0,
+      valueCents: 264_520,
+    });
+    // Under 15 000 km only the 45 € safety inspection is needed: credit 264 520 - 4 500.
+    expect(quote.refurbishment.totalCents).toBe(4_500);
+    expect(quote.returnCreditCents).toBe(260_020);
 
     expect(quote.buyout.netCents).toBe(330_666);
-    expect(quote.returnItem.netCents).toBe(66_146);
+    // 330 666 - 260 020
+    expect(quote.returnItem.netCents).toBe(70_646);
   });
 
   it('charges VAT at the rate on the exit date (26 % from 2027)', async () => {
     const quote = calculateEarlyExit(await cardInput('2027-05-05'));
 
-    // 66 146 × 26 % = 17 197.96 -> 17 198
+    // 70 646 × 26 % = 18 367.96 -> 18 368
     expect(quote.returnItem.settlement).toMatchObject({
-      buyoutNetCents: 66_146,
+      buyoutNetCents: 70_646,
       vatRatePercent: 26,
-      vatCents: 17_198,
-      grossCents: 83_344,
+      vatCents: 18_368,
+      grossCents: 89_014,
     });
     // 330 666 × 26 % = 85 973.16 -> 85 973
     expect(quote.buyout.settlement).toMatchObject({ vatCents: 85_973, grossCents: 416_639 });
@@ -183,14 +201,14 @@ describe('calculateEarlyExit', () => {
       'buyout',
       'interestNotCharged',
       'returnCredit',
+      'refurbishment',
     ]);
     // 29 × 10 730 = 311 170; + 58 350 buyout; - interest not charged = balance 330 666
     expect(quote.buyout.lines.map((l) => l.amountCents)).toEqual([311_170, 58_350, -38_854]);
-    expect(quote.returnItem.lines.at(-1)).toEqual({
-      key: 'returnCredit',
-      amountCents: -264_520,
-      params: { ageMonths: 7 },
-    });
+    expect(quote.returnItem.lines.slice(-2)).toEqual([
+      { key: 'returnCredit', amountCents: -264_520, params: { ageMonths: 7, usageValue: 0 } },
+      { key: 'refurbishment', amountCents: 4_500, params: {} },
+    ]);
     for (const option of [quote.buyout, quote.returnItem]) {
       expect(option.lines.reduce((sum, l) => sum + l.amountCents, 0)).toBe(option.netCents);
     }
@@ -204,7 +222,7 @@ describe('calculateEarlyExit', () => {
     expect(quote.balanceCents).toBe(380_823);
     // 389 000 × 97 % (age 1) × 0.85 = 320 730.5, rounded half up to 320 731
     expect(quote.marketValue.valueCents).toBe(320_731);
-    expect(quote.returnItem.netCents).toBe(380_823 - 320_731);
+    expect(quote.returnItem.netCents).toBe(380_823 - (320_731 - 4_500));
   });
 
   it('final month: the buyout option equals the end-of-term buyout and returning is free', async () => {
@@ -277,6 +295,50 @@ describe('calculateEarlyExit', () => {
     expect(results.poor).toBeGreaterThan(results.new);
   });
 
+  it('a returned item costs more to return the more it was used', async () => {
+    const at = async (km: number) =>
+      calculateEarlyExit(await cardInput('2027-05-05', { usage: { unit: 'km', value: km } }))
+        .returnItem.netCents;
+    expect(await at(2_000)).toBeGreaterThan(await at(0));
+    expect(await at(9_000)).toBeGreaterThan(await at(2_000));
+  });
+
+  it('from 15 000 km a new battery is deducted and the item is valued as if at 0 km', async () => {
+    const quote = calculateEarlyExit(
+      await cardInput('2027-05-05', { usage: { unit: 'km', value: 15_000 } })
+    );
+    expect(quote.refurbishment.steps.map((s) => s.id)).toEqual([
+      'battery_replacement',
+      'safety_inspection',
+    ]);
+    expect(quote.marketValue).toMatchObject({ usageValue: 0, valueCents: 264_520 });
+    // 264 520 - 35 000 - 4 500
+    expect(quote.returnCreditCents).toBe(225_020);
+    expect(quote.returnItem.netCents).toBe(330_666 - 225_020);
+  });
+
+  it('refurbishment never makes the credit negative', async () => {
+    // A 10 € item is worth about 6.80 € at 7 months: the 45 € inspection only cancels it.
+    const quote = calculateEarlyExit(await cardInput('2027-05-05', { firstListPriceCents: 1_000 }));
+    expect(quote.returnCreditCents).toBe(0);
+    const refurbishment = quote.returnItem.lines.find((l) => l.key === 'refurbishment');
+    expect(refurbishment?.amountCents).toBe(quote.marketValue.valueCents);
+  });
+
+  it('rejects a usage at exit below the usage at the start', async () => {
+    await expect(async () =>
+      calculateEarlyExit(
+        await cardInput('2027-05-05', {
+          usage: { unit: 'km', value: 100 },
+          usageAtStartValue: 200,
+        })
+      )
+    ).rejects.toThrow(/below the usage at the start/);
+    await expect(async () =>
+      calculateEarlyExit(await cardInput('2027-05-05', { usageAtStartValue: -1 }))
+    ).rejects.toThrow(RangeError);
+  });
+
   it('rejects an exit date before the lease starts', async () => {
     await expect(async () => calculateEarlyExit(await cardInput('2026-11-04'))).rejects.toThrow(
       RangeError
@@ -324,9 +386,10 @@ function billedDate(month: number): string {
 }
 
 describe('earlyExitForContract', () => {
-  async function card1(exitMonth: number) {
-    const [coefficientTable, residualCurves, vatRates] = await Promise.all([
+  async function card1(exitMonth: number, usageValue = 0) {
+    const [coefficientTable, refurbishmentCosts, residualCurves, vatRates] = await Promise.all([
       loadCoefficientTable(),
+      loadRefurbishmentCosts(),
       loadResidualCurves(),
       loadVatRates(),
     ]);
@@ -344,8 +407,9 @@ describe('earlyExitForContract', () => {
       quote: result.quote,
       signedOn: '2026-11-05',
       exitMonth,
-      condition: 'good',
+      inspection: { condition: 'good', usageValue },
       asset: { category: 'e_bike', usage: { unit: 'km', value: 0 } },
+      refurbishmentCosts,
       residualCurves,
       vatRates,
     });
@@ -356,7 +420,14 @@ describe('earlyExitForContract', () => {
     expect(quote.asOf).toBe('2027-05-05');
     expect(quote.remainingMonths).toBe(29);
     expect(quote.buyout.netCents).toBe(330_666);
-    expect(quote.returnItem.netCents).toBe(66_146);
+    expect(quote.returnItem.netCents).toBe(70_646);
+  });
+
+  it('values the item at the inspected usage, not the reading from the start of the lease', async () => {
+    // 6 000 km: -12 % usage adjustment. 389 000 × 80 % × 0.85 × 0.88 = 232 777.6 -> 232 778
+    const quote = await card1(7, 6_000);
+    expect(quote.marketValue).toMatchObject({ usageValue: 6_000, valueCents: 232_778 });
+    expect(quote.returnItem.netCents).toBe(330_666 - (232_778 - 4_500));
   });
 
   it('clamps a month past the term to the last rent row: the end-of-term buyout', async () => {
@@ -368,5 +439,50 @@ describe('earlyExitForContract', () => {
   it('rejects month 0 and fractional months', async () => {
     await expect(card1(0)).rejects.toThrow(RangeError);
     await expect(card1(1.5)).rejects.toThrow(RangeError);
+  });
+});
+
+describe('checkReturnInspection', () => {
+  const recorded = { condition: 'good', usageValue: 1_200 } as const;
+
+  it('accepts the same or a worse condition and the same or a higher reading', () => {
+    expect(checkReturnInspection(recorded, { condition: 'good', usageValue: 1_200 })).toEqual({
+      ok: true,
+    });
+    expect(checkReturnInspection(recorded, { condition: 'poor', usageValue: 9_000 })).toEqual({
+      ok: true,
+    });
+  });
+
+  it('rejects a reading below the one recorded at the start of the lease', () => {
+    expect(checkReturnInspection(recorded, { condition: 'good', usageValue: 1_199 })).toEqual({
+      ok: false,
+      problem: 'usage_decreased',
+    });
+  });
+
+  it('rejects an item that comes back in better condition than it left in', () => {
+    expect(checkReturnInspection(recorded, { condition: 'like_new', usageValue: 1_200 })).toEqual({
+      ok: false,
+      problem: 'condition_improved',
+    });
+  });
+
+  it('rejects a negative or fractional reading', () => {
+    for (const usageValue of [-1, 1_250.5, Number.NaN]) {
+      expect(checkReturnInspection(recorded, { condition: 'good', usageValue })).toEqual({
+        ok: false,
+        problem: 'invalid_usage',
+      });
+    }
+  });
+});
+
+describe('worseCondition', () => {
+  it('picks the worse of two conditions, in either order', () => {
+    expect(worseCondition('good', 'new')).toBe('good');
+    expect(worseCondition('new', 'good')).toBe('good');
+    expect(worseCondition('poor', 'fair')).toBe('poor');
+    expect(worseCondition('like_new', 'like_new')).toBe('like_new');
   });
 });

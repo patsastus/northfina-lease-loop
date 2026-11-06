@@ -32,9 +32,14 @@ const CARD_8: ExecuteEarlyExitInput = {
   downPaymentCents: 0,
   signedOn: '2026-11-05',
   exitMonth: 7,
-  condition: 'good',
   actor: 'cust-aino',
 };
+
+// ebike-003 left in 'new' condition at 0 km. It comes back 'fair' with 4 000 km.
+const FAIR_RETURN = {
+  choice: 'return',
+  inspection: { condition: 'fair', usageValue: 4_000, inspectedBy: 'Workshop Vantaa' },
+} as const;
 
 async function auditRows() {
   const rows = await db.auditLog.findMany({ orderBy: { id: 'asc' } });
@@ -81,21 +86,69 @@ describe('executeEarlyExit', () => {
     expect(lineSum).toBe(330_666);
   });
 
-  it('returns card 8 in fair condition: pays the shortfall and records the condition', async () => {
-    const result = await executeEarlyExit(db, { ...CARD_8, choice: 'return', condition: 'fair' });
+  it('returns card 8 as inspected: pays the shortfall and records condition and usage', async () => {
+    const result = await executeEarlyExit(db, { ...CARD_8, ...FAIR_RETURN });
 
+    // Market value 389 000 × 80 % × 0.65 (fair) × 0.92 (4 000 km: -8 %) = 186 097.6 -> 186 098.
+    // Credit 186 098 - 4 500 inspection = 181 598; 330 666 - 181 598 = 149 068.
     expect(result).toMatchObject({
       ok: true,
-      asset: { status: 'returned', condition: 'fair' },
-      receipt: { choice: 'return', netCents: 128_386 },
+      asset: { status: 'returned', condition: 'fair', usage: { unit: 'km', value: 4_000 } },
+      receipt: { choice: 'return', netCents: 149_068 },
     });
-    expect((await auditRows()).map((row) => row.action)).toEqual(['lease.early_return']);
+    const [row] = await auditRows();
+    expect(row).toMatchObject({
+      action: 'lease.early_return',
+      details: {
+        inspection: {
+          condition: 'fair',
+          usage: { unit: 'km', value: 4_000 },
+          inspectedBy: 'Workshop Vantaa',
+        },
+        recordedAtStart: { condition: 'new', usage: { unit: 'km', value: 0 } },
+        marketValueCents: 186_098,
+        returnCreditCents: 181_598,
+        refurbishment: { totalCents: 4_500 },
+      },
+    });
+  });
+
+  it('refuses a return without an inspection, or with an impossible one, and writes nothing', async () => {
+    await db.asset.update({
+      where: { id: 'ebike-003' },
+      data: { condition: 'good', usage_value: 1_000 },
+    });
+    const inspect = (condition: 'like_new' | 'good', usageValue: number) => ({
+      ...CARD_8,
+      choice: 'return' as const,
+      inspection: { condition, usageValue, inspectedBy: 'Workshop Vantaa' },
+    });
+
+    expect(await executeEarlyExit(db, { ...CARD_8, choice: 'return' })).toEqual({
+      ok: false,
+      reason: 'invalid_inspection',
+      problem: 'missing',
+    });
+    expect(await executeEarlyExit(db, inspect('good', 999))).toEqual({
+      ok: false,
+      reason: 'invalid_inspection',
+      problem: 'usage_decreased',
+    });
+    expect(await executeEarlyExit(db, inspect('like_new', 1_000))).toEqual({
+      ok: false,
+      reason: 'invalid_inspection',
+      problem: 'condition_improved',
+    });
+    expect(await auditRows()).toEqual([]);
+    expect((await db.asset.findUniqueOrThrow({ where: { id: 'ebike-003' } })).status).toBe(
+      'reserved'
+    );
   });
 
   it('refuses a second exit of the same lease and writes nothing', async () => {
     await executeEarlyExit(db, CARD_8);
 
-    expect(await executeEarlyExit(db, { ...CARD_8, choice: 'return' })).toEqual({
+    expect(await executeEarlyExit(db, { ...CARD_8, ...FAIR_RETURN })).toEqual({
       ok: false,
       reason: 'lease_ended',
     });
@@ -106,7 +159,7 @@ describe('executeEarlyExit', () => {
   it('lets only one of two simultaneous exits through', async () => {
     const results = await Promise.all([
       executeEarlyExit(db, CARD_8),
-      executeEarlyExit(db, { ...CARD_8, choice: 'return' }),
+      executeEarlyExit(db, { ...CARD_8, ...FAIR_RETURN }),
     ]);
 
     expect(results.filter((r) => r.ok)).toHaveLength(1);

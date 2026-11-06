@@ -205,16 +205,21 @@ balance(asOf) = Σ_{i=1..m} rent / (1 + r)^i  +  buyout / (1 + r)^m
 **The customer chooses one of two exit options:**
 
 1. **Early buyout, keep the item:** pay `balance`. The asset becomes `sold`.
-2. **Early return:** pay `max(0, min(balance − returnCredit, nominalRemainingRents))`, where `returnCredit = marketValue(item at asOf, condition, usage)`. Market value comes from `second-life/` (§9), so the item's value at exit and its relist price use one formula. The asset becomes `returned`.
+2. **Early return:** pay `max(0, min(balance − returnCredit, nominalRemainingRents))`, where `returnCredit = max(0, marketValue(item at asOf, condition, usage) − fixedRefurbishment)`. Market value uses the same formula as the relist price. `fixedRefurbishment` is the sum of the `fixed` steps in `refurbishment-costs.json` whose rule applies (`domain/refurbishment.ts`: the e-bike safety inspection always, a battery from 15 000 km, and so on). A step that resets usage (a new battery) values the item at 0 usage. Optional condition upgrades are not deducted. The asset becomes `returned`, with the inspected condition and usage as its new record.
 
-The quote takes `condition` and `usage` as inputs. The customer declares them, and the screen says "final amount confirmed after inspection". Default: `good`, current usage.
+The credit is what the returned item is worth to the lessor in cash, not its gross resale value. Without the refurbishment deduction the lessor would pay for the inspection out of its own pocket on every early return.
+
+**The return inspection.** `condition` and `usage` come from the inspection when the item comes back, never from the stored asset: that reading is from the start of the lease, so pricing with it would credit a bike ridden for two years as if it had 0 km. A return needs `{ condition, usageValue, inspectedBy }`, and `checkReturnInspection` refuses a reading below the record or a condition better than the record (refurbishment happens after the return). The page defaults to the worse of `good` and the recorded condition, at the recorded reading, and the return cannot be confirmed until an inspector is named. The app has no login, so this records and bounds the inspection but cannot prove who made it.
+
+**Why late returns can still be free.** The e-bike curve keeps 40 % of the value at 36 months, while the contract buyout is 15 %. Late in the term the item is worth more than everything still owed, so the lessor is ahead when it gets the item back. For a 2,624 € e-bike in good condition at 250 km a month, returns are free from month 30 (before these fixes, it was month 25 at 0 km). The customer gives up the difference; the early buyout lets them keep it instead.
 
 **Card 8 (Aino, ebike-003, exit after the 7th invoice, good condition, 0 km):** 29 rows remain.
 
 - Balance ≈ 330666.
 - Market value = 389000 × 80 % (age 7 months, interpolated from 82 % at 6 and 70 % at 12) × 0.85 (good) = 264520.
-- Credit = 264520.
-- **Early-return cost = 330666 − 264520 = 66146, i.e. €661.46 net + VAT.** For comparison, the nominal remaining rents plus buyout are €3,695.20.
+- Refurbishment before the next lease: the safety inspection, 4500 (under 15 000 km, no battery).
+- Credit = 264520 − 4500 = 260020.
+- **Early-return cost = 330666 − 260020 = 70646, i.e. €706.46 net + VAT.** For comparison, the nominal remaining rents plus buyout are €3,695.20.
 
 The UI shows every line. The domain fixes the exact figures; tests pin them.
 
@@ -222,7 +227,7 @@ The UI shows every line. The domain fixes the exact figures; tests pin them.
 
 **The closing invoice** is a row of kind `exit_return` or `exit_buyout`, dated `asOf`, with VAT at that date's rate. Unbilled rent rows stay stored but are marked `cancelled_by_exit` (the only status ever set on a row after creation; amounts never change).
 
-**Config [Decision]:** no extra exit fee, and the return credit is 100 % of the net market value. Both live in `config` (§10) so the judges' surprise scenarios can turn them.
+**Config [Decision]:** no extra exit fee, and the return credit is the market value minus the fixed refurbishment from the data pack. There is no extra remarketing haircut: it would be a number the data pack does not give.
 
 ## 8. Question flow and eligibility (#4)
 
@@ -388,5 +393,5 @@ These become the full-loop integration test and the demo script.
 ## 15. Open questions for review
 
 1. Quote validity: does a locked quote expire (for example after 30 days), or hold until signed? Proposed: no expiry in phase 1.
-2. Early return credit: 100 % of net market value, or a remarketing haircut?
+2. Early return credit: market value minus the data pack's fixed refurbishment (decided, §7). A remarketing haircut on top is still open.
 3. Due date = invoice date (proposed), or invoice date + 14 days?
